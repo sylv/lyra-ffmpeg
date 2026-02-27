@@ -22,6 +22,8 @@
 
 #include "config.h"
 #include "config_components.h"
+#include <errno.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include <time.h>
 #if HAVE_UNISTD_H
@@ -132,6 +134,7 @@ typedef struct VariantStream {
 
     int has_video;
     int has_subtitle;
+    int64_t next_cut_idx;
     int new_start;
     int start_pts_from_audio;
     double dpp;           // duration per packet
@@ -217,6 +220,9 @@ typedef struct HLSContext {
     int allowcache;
     int64_t recording_time;
     int64_t max_seg_size; // every segment file max size
+    char *cuts_str;
+    int64_t *cuts;
+    int nb_cuts;
 
     char *baseurl;
     char *vtt_format_options_str;
@@ -262,6 +268,87 @@ typedef struct HLSContext {
     int has_default_key; /* has DEFAULT field of var_stream_map */
     int has_video_m3u8; /* has video stream m3u8 list */
 } HLSContext;
+
+static int parse_hls_cuts(HLSContext *hls)
+{
+    int i = 0;
+    int count = 1;
+    int64_t prev = AV_NOPTS_VALUE;
+    const char *p = NULL;
+    char *cuts_tmp = NULL;
+    char *token = NULL;
+    char *saveptr = NULL;
+
+    if (!hls->cuts_str || !*hls->cuts_str) {
+        hls->nb_cuts = 0;
+        return 0;
+    }
+
+    for (p = hls->cuts_str; *p; p++) {
+        if (*p == ',')
+            count++;
+    }
+
+    hls->cuts = av_malloc_array(count, sizeof(*hls->cuts));
+    if (!hls->cuts)
+        return AVERROR(ENOMEM);
+
+    cuts_tmp = av_strdup(hls->cuts_str);
+    if (!cuts_tmp) {
+        av_freep(&hls->cuts);
+        return AVERROR(ENOMEM);
+    }
+
+    token = av_strtok(cuts_tmp, ",", &saveptr);
+    while (token) {
+        char *endptr = NULL;
+        int64_t cut_pts = 0;
+
+        while (*token == ' ' || *token == '\t')
+            token++;
+        if (!*token) {
+            av_log(hls, AV_LOG_ERROR, "Invalid empty value in hls_cuts\n");
+            goto fail;
+        }
+
+        errno = 0;
+        cut_pts = strtoll(token, &endptr, 10);
+        while (endptr && (*endptr == ' ' || *endptr == '\t'))
+            endptr++;
+
+        if (errno == ERANGE || endptr == token || (endptr && *endptr)) {
+            av_log(hls, AV_LOG_ERROR, "Invalid hls_cuts value '%s'\n", token);
+            goto fail;
+        }
+        if (cut_pts < 0) {
+            av_log(hls, AV_LOG_ERROR, "hls_cuts values must be non-negative\n");
+            goto fail;
+        }
+        if (prev != AV_NOPTS_VALUE && cut_pts <= prev) {
+            av_log(hls, AV_LOG_ERROR, "hls_cuts values must be strictly increasing\n");
+            goto fail;
+        }
+
+        hls->cuts[i++] = cut_pts;
+        prev = cut_pts;
+        token = av_strtok(NULL, ",", &saveptr);
+    }
+
+    av_freep(&cuts_tmp);
+    hls->nb_cuts = i;
+    if (!hls->nb_cuts) {
+        av_log(hls, AV_LOG_ERROR, "hls_cuts did not contain any valid values\n");
+        goto fail;
+    }
+
+    return 0;
+
+fail:
+    av_freep(&cuts_tmp);
+    av_freep(&hls->cuts);
+    hls->nb_cuts = 0;
+    return AVERROR(EINVAL);
+}
 
 static int strftime_expand(const char *fmt, char **dest)
 {
@@ -2484,8 +2571,11 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
     }
 
     can_split = can_split && (pkt->pts - vs->end_pts > 0);
-    if (vs->packets_written && can_split && av_compare_ts(pkt->pts - vs->start_pts, st->time_base,
-                                                          end_pts, AV_TIME_BASE_Q) >= 0) {
+    if (vs->packets_written && can_split &&
+        ((hls->nb_cuts > 0 && vs->next_cut_idx < hls->nb_cuts &&
+          av_compare_ts(pkt->pts, st->time_base, hls->cuts[vs->next_cut_idx], AV_TIME_BASE_Q) >= 0) ||
+         (hls->nb_cuts == 0 &&
+          av_compare_ts(pkt->pts - vs->start_pts, st->time_base, end_pts, AV_TIME_BASE_Q) >= 0))) {
         int64_t new_start_pos;
         int byterange_mode = (hls->flags & HLS_SINGLE_FILE) || (hls->max_seg_size > 0);
         double cur_duration;
@@ -2653,6 +2743,9 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
             ret = hls_start(s, vs);
         }
         vs->number++;
+        if (hls->nb_cuts > 0 && vs->next_cut_idx < hls->nb_cuts) {
+            vs->next_cut_idx++;
+        }
         av_freep(&old_filename);
 
         if (ret < 0) {
@@ -2705,6 +2798,7 @@ static void hls_deinit(AVFormatContext *s)
     ff_format_io_close(s, &hls->sub_m3u8_out);
     ff_format_io_close(s, &hls->http_delete);
     av_freep(&hls->key_basename);
+    av_freep(&hls->cuts);
     av_freep(&hls->var_streams);
     av_freep(&hls->cc_streams);
     av_freep(&hls->master_m3u8_url);
@@ -2936,6 +3030,10 @@ static int hls_init(AVFormatContext *s)
         av_log(hls, AV_LOG_DEBUG, "start_number evaluated to %"PRId64"\n", hls->start_sequence);
     }
 
+    ret = parse_hls_cuts(hls);
+    if (ret < 0)
+        return ret;
+
     hls->recording_time = hls->init_time && hls->max_nb_segments > 0 ? hls->init_time : hls->time;
 
     if (hls->flags & HLS_SPLIT_BY_TIME && hls->flags & HLS_INDEPENDENT_SEGMENTS) {
@@ -2954,6 +3052,14 @@ static int hls_init(AVFormatContext *s)
             return ret;
 
         vs->sequence  = hls->start_sequence;
+        if (hls->nb_cuts > 0) {
+            if (vs->sequence < 0 || vs->sequence + 1 >= hls->nb_cuts)
+                vs->next_cut_idx = hls->nb_cuts;
+            else
+                vs->next_cut_idx = vs->sequence + 1;
+        } else {
+            vs->next_cut_idx = 0;
+        }
         vs->start_pts = AV_NOPTS_VALUE;
         vs->end_pts   = AV_NOPTS_VALUE;
         vs->current_segment_final_filename_fmt[0] = '\0';
@@ -3112,6 +3218,7 @@ static const AVOption options[] = {
     {"hls_vtt_options","set hls vtt list of options for the container format used for hls", OFFSET(vtt_format_options_str), AV_OPT_TYPE_STRING, {.str = NULL},  0, 0,    E},
     {"hls_allow_cache", "explicitly set whether the client MAY (1) or MUST NOT (0) cache media segments", OFFSET(allowcache), AV_OPT_TYPE_INT, {.i64 = -1}, INT_MIN, INT_MAX, E},
     {"hls_base_url",  "url to prepend to each playlist entry",   OFFSET(baseurl), AV_OPT_TYPE_STRING, {.str = NULL},  0, 0,       E},
+    {"hls_cuts",      "comma-separated absolute cut PTS values in AV_TIME_BASE units", OFFSET(cuts_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, E},
     {"hls_segment_filename", "filename template for segment files", OFFSET(segment_filename),   AV_OPT_TYPE_STRING, {.str = NULL},            0,       0,         E},
     {"hls_segment_options","set segments files format options of hls", OFFSET(format_options), AV_OPT_TYPE_DICT, {.str = NULL},  0, 0,    E},
     {"hls_segment_size", "maximum size per segment file, (in bytes)",  OFFSET(max_seg_size),    AV_OPT_TYPE_INT,    {.i64 = 0},               0,       INT_MAX,   E},
