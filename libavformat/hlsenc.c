@@ -3053,10 +3053,10 @@ static int hls_init(AVFormatContext *s)
 
         vs->sequence  = hls->start_sequence;
         if (hls->nb_cuts > 0) {
-            if (vs->sequence < 0 || vs->sequence + 1 >= hls->nb_cuts)
+            if (vs->sequence < 0 || vs->sequence >= hls->nb_cuts)
                 vs->next_cut_idx = hls->nb_cuts;
             else
-                vs->next_cut_idx = vs->sequence + 1;
+                vs->next_cut_idx = vs->sequence;
         } else {
             vs->next_cut_idx = 0;
         }
